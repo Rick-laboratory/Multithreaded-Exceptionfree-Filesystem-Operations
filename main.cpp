@@ -1,82 +1,60 @@
-#include<iostream>
-#include<filesystem>
-#include<vector>
-#include<string>
-#include<wchar.h>
-#include<thread>
+#include "scan.hpp"
 
-void coutAccessibleFile(std::vector<std::string> &paths) {
-	FILE* pFile;
-	for (size_t i = 0; i < paths.size(); i++)
-	{
-		std::filesystem::path entry = paths[i];
-		//This part defeats the nasty exceptions that will occur due to not being able to access files
-		_wfopen_s(&pFile, entry.wstring().c_str(), L"r");
-		if (pFile != NULL) {
-			fclose(pFile);
-			if (std::filesystem::is_regular_file(entry))
-				std::cout << paths[i] << " is_regular_file" << "\n";
-		}
-	}
+#include <iostream>
+#include <string>
+#include <thread>
+
+namespace {
+std::string utf8_path(const std::filesystem::path& path) {
+    const auto bytes = path.u8string();
+    // C++17 returns string; C++20 returns u8string. Preserve the encoded bytes.
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
-int main(void) {
-	std::vector<std::wstring> _filepaths;
-	try
-	{
-		//This part in its current form is not sensible for exceptions as long as we just collect paths its totally safe
-		//Trying to find out what status a file has, if its is_regular_file() is indeed sensible aslong as we dont check its accessibility before
-		//The try catch block is how i found out the access issues by trying to check if a file is regular. You can try it yourself
-		for (const auto& entry : std::filesystem::recursive_directory_iterator("C:\\", std::filesystem::directory_options::skip_permission_denied)) {
-				_filepaths.push_back(entry.path().wstring());
-		}
-	}
-	catch (std::filesystem::filesystem_error const &e)
-	{
-		std::cout << e.what() << "\n";
-	}
+template <typename Character>
+int run(int argc, Character* argv[]) {
+    namespace fs = std::filesystem;
+    try {
+        if (argc == 2 && (fs::path(argv[1]) == "--help" || fs::path(argv[1]) == "-h")) {
+            std::cout << "Usage: filesystem-inspect [directory]\n"
+                         "List regular files under a directory; default: current directory.\n"
+                         "Paths are printed as UTF-8. No files are modified or opened for content.\n";
+            return 0;
+        }
+        if (argc > 2) {
+            std::cerr << "Usage: filesystem-inspect [directory]\n";
+            return 2;
+        }
 
-	//Work Splitting Procedere
-	int hardwareCount = std::thread::hardware_concurrency();
-	int workLoad = _filepaths.size() / hardwareCount;
-	int restLoad = _filepaths.size() - (workLoad * hardwareCount);
-
-	std::vector<std::string> *Splits = new std::vector<std::string>[hardwareCount];
-	int control = 0;
-	for (size_t i = 0; i < hardwareCount; i++)
-	{
-		if (i == hardwareCount - 1)
-			workLoad += restLoad;
-		for (size_t j = 0; j < workLoad; j++)
-		{
-			//The std::string str(); allocation procedere ensures we dont overrun the standard size of a string as far as i understood
-			//It ensures the allocation of a string size thats big enough to hold the wide string. 
-			std::string str(_filepaths[j+control].begin(), _filepaths[j+control].end());
-			Splits[i].push_back(str);
-		}
-		control += workLoad;
-	}
-
-	//Displays the workload of each chunk
-	for (size_t i = 0; i < hardwareCount; i++)
-	{
-		std::cout << Splits[i].size() << std::endl;
-	}
-
-	//Creates a Threadpool with the size of available hardwareThreads
-	std::vector<std::thread> pool(hardwareCount - 1);
-	for (int i = 0; i < hardwareCount - 1; i++) {
-		pool[i] = std::thread(coutAccessibleFile, std::ref(Splits[i]));
-	}
-	for (auto & t : pool)
-	{
-		t.join();
-	}
-
-	delete[] Splits;
-
-	system("cls");
-	std::cout << "Exceptions using std::filesystem DEFEATED!!!" << std::endl;
-	system("pause");
-	return 0;
+        const fs::path root = argc == 2 ? fs::path(argv[1]) : fs::current_path();
+        const inspection::Report report = inspection::scan(root, std::thread::hardware_concurrency());
+        std::size_t regular_files = 0;
+        std::size_t failures = 0;
+        for (const auto& entry : report.entries) {
+            if (entry.error) {
+                ++failures;
+                std::cerr << utf8_path(entry.path) << ": " << entry.error.message() << '\n';
+            } else if (entry.type == fs::file_type::regular) {
+                ++regular_files;
+                std::cout << utf8_path(entry.path) << '\n';
+            }
+        }
+        if (report.traversal_error) {
+            ++failures;
+            std::cerr << "Traversal: " << report.traversal_error.message() << '\n';
+        }
+        std::cerr << "Inspected " << report.entries.size() << " entries with " << report.workers
+                  << " workers; " << regular_files << " regular files; " << failures << " errors.\n";
+        return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }
+} // namespace
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t* argv[]) { return run(argc, argv); }
+#else
+int main(int argc, char* argv[]) { return run(argc, argv); }
+#endif
